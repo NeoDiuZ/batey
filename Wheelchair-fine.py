@@ -8,15 +8,13 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from threading import Thread
-import subprocess
-import psutil
-import keyboard
+from collections import deque
+from scipy.signal import medfilt
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from datetime import datetime
 import joblib
 import os
-from collections import deque
 
 app = Flask(__name__)
 CORS(app)
@@ -29,14 +27,9 @@ FEATURES = ['delta', 'theta', 'alpha_l', 'alpha_h', 'beta_l', 'beta_h']
 
 # Global variables
 last_function_call_time = time.time()
-ranges = {
-    'high': 75,
-    'medium': 50,                           
-    'low': 25
-}
-
 latest_attention_value = 0
-model_manager = None
+signal_processor = None
+last_state = None
 
 class EEGModelManager:
     def __init__(self, window_size=1000, fine_tune_threshold=100, validation_size=0.2):
@@ -130,54 +123,79 @@ class EEGModelManager:
         self.performance_history = checkpoint['performance_history']
         print(f"Model loaded from checkpoint: {checkpoint_path}")
 
-def extract_features(eeg_data): 
-    return np.array([eeg_data[f] for f in FEATURES]).reshape(1, -1)
+class AttentionSignalProcessor:
+    def __init__(self, 
+                 window_size=10,
+                 median_window=5,
+                 threshold_change=20,
+                 min_stable_duration=1.0):
+        self.window_size = window_size
+        self.median_window = median_window
+        self.threshold_change = threshold_change
+        self.min_stable_duration = min_stable_duration
+        
+        self.attention_buffer = deque(maxlen=window_size)
+        self.last_filtered_value = None
+        self.last_state_change = 0
+        self.current_state = None
+    
+    def moving_average_filter(self, value):
+        self.attention_buffer.append(value)
+        return np.mean(self.attention_buffer)
+    
+    def median_filter(self, values):
+        return float(medfilt(np.array(values), self.median_window)[0])
+    
+    def hysteresis_filter(self, value):
+        current_time = time.time()
+        new_state = 'MOVE' if value > 80 else 'STAY'
+        
+        if (self.current_state != new_state and 
+            current_time - self.last_state_change >= self.min_stable_duration):
+            self.current_state = new_state
+            self.last_state_change = current_time
+            return new_state
+        
+        return self.current_state
+    
+    def process_attention(self, value):
+        ma_value = self.moving_average_filter(value)
+        
+        if len(self.attention_buffer) >= self.median_window:
+            med_value = self.median_filter(list(self.attention_buffer))
+        else:
+            med_value = ma_value
+        
+        if self.last_filtered_value is not None:
+            change = med_value - self.last_filtered_value
+            if abs(change) > self.threshold_change:
+                med_value = self.last_filtered_value + np.sign(change) * self.threshold_change
+        
+        self.last_filtered_value = med_value
+        state = self.hysteresis_filter(med_value)
+        
+        return med_value, state
 
 async def send_command_via_websocket(command):
-    try:        
+    try:
         async with websockets.connect(ESP32_URI) as websocket:
             await websocket.send(command)
             print(f"Sent command via WebSocket: {command}")
     except Exception as e:
         print(f"Failed to send command via WebSocket: {e}")
 
-def A():
-    print(f"Function A: Attention is high (more than {ranges['high']})")
-    asyncio.run(send_command_via_websocket('A'))
+def MOVE():
+    print("Function MOVE: Attention is high (more than 80)")
+    asyncio.run(send_command_via_websocket('MOVE'))
 
-def B():
-    print(f"Function B: Attention is medium-high (more than {ranges['medium']} but less than or equal to {ranges['high']})")
-    asyncio.run(send_command_via_websocket('B'))
+def STAY():
+    print("Function STAY: Attention is low (less than or equal to 80)")
+    asyncio.run(send_command_via_websocket('STAY'))
 
-def C():
-    print(f"Function C: Attention is medium-low (more than {ranges['low']} but less than or equal to {ranges['medium']})")
-    asyncio.run(send_command_via_websocket('C'))
+def extract_features(eeg_data):
+    return np.array([eeg_data[f] for f in FEATURES]).reshape(1, -1)
 
-def D():
-    print(f"Function D: Attention is low (more than 0 but less than or equal to {ranges['low']})")
-    asyncio.run(send_command_via_websocket('D'))
-
-def handle_key_input():
-    while True:
-        try:
-            if keyboard.is_pressed('w'):
-                A()
-                time.sleep(0.5)
-            elif keyboard.is_pressed('a'):
-                B()
-                time.sleep(0.5)
-            elif keyboard.is_pressed('s'):
-                C()
-                time.sleep(0.5)
-            elif keyboard.is_pressed('d'):
-                D()
-                time.sleep(0.5)
-        except Exception as e:
-            print(f"Error in handling key input: {e}")
-
-def eeg_callback(data):
-    global model_manager
-
+def eeg_callback(data, model_manager):
     features = extract_features(data)
     
     if model_manager.model is None:
@@ -198,47 +216,32 @@ def meditation_callback(value):
     print("Meditation: ", value)
 
 def attention_callback(value):
-    global last_function_call_time, ranges, latest_attention_value
-
-    print("Attention: ", value)
-    latest_attention_value = value
-
+    global last_function_call_time, latest_attention_value, signal_processor, last_state
+    
+    filtered_value, state = signal_processor.process_attention(value)
+    latest_attention_value = filtered_value
+    
+    print(f"Raw Attention: {value}, Filtered: {filtered_value:.1f}, State: {state}")
+    
     current_time = time.time()
-    if current_time - last_function_call_time >= 1:
-        if value > ranges['high']:
-            A()
-        elif value > ranges['medium']:
-            B()
-        elif value > ranges['low']:
-            C()
+    if current_time - last_function_call_time >= 1 and state != last_state:
+        if state == 'MOVE':
+            MOVE()
         else:
-            D()
+            STAY()
         last_function_call_time = current_time
+        last_state = state
 
 @app.route('/get_attention', methods=['GET'])
 def get_attention():
     return jsonify({"attention": latest_attention_value}), 200
 
-@app.route('/update_ranges', methods=['POST'])
-def update_ranges():
-    global ranges
-    new_ranges = request.json
-    ranges['high'] = new_ranges.get('high', ranges['high'])
-    ranges['medium'] = new_ranges.get('medium', ranges['medium'])
-    ranges['low'] = new_ranges.get('low', ranges['low'])
-    print(f"Ranges updated: {ranges}")
-    return jsonify({"message": "Ranges updated successfully"}), 200
-
-@app.route('/get_ranges', methods=['GET'])
-def get_ranges():
-    return jsonify(ranges), 200
-
 @app.route('/get_model_performance', methods=['GET'])
 def get_model_performance():
-    if model_manager and model_manager.performance_history:
+    if hasattr(model_manager, 'performance_history'):
         return jsonify({
             "performance_history": model_manager.performance_history,
-            "latest_score": model_manager.performance_history[-1]
+            "latest_score": model_manager.performance_history[-1] if model_manager.performance_history else None
         }), 200
     return jsonify({"error": "Model performance data not available"}), 404
 
@@ -246,34 +249,37 @@ def run_flask():
     app.run(debug=False, port=5000)
 
 def main():
-    global last_function_call_time, model_manager
+    global last_function_call_time, signal_processor, model_manager
 
-    # Initialize model manager
     model_manager = EEGModelManager(
         window_size=1000,
         fine_tune_threshold=100,
         validation_size=0.2
     )
 
+    signal_processor = AttentionSignalProcessor(
+        window_size=10,
+        median_window=5,
+        threshold_change=20,
+        min_stable_duration=1.0
+    )
+
+    #Counter the first STAY command
+    print("Sending initial MOVE command...")
+    MOVE()
+    last_state = 'MOVE'
+    
     # Start Flask in a separate thread
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Start keyboard input handling in a separate thread
-    keyboard_thread = Thread(target=handle_key_input)
-    keyboard_thread.daemon = True
-    keyboard_thread.start()
-
-    # Initialize the MindWave device
     mw = MindWave(address='A4:DA:32:70:03:4E', autostart=False, verbose=3)
 
-    # Set up callbacks
-    mw.set_callback('eeg', eeg_callback)
+    mw.set_callback('eeg', lambda data: eeg_callback(data, model_manager))
     mw.set_callback('meditation', meditation_callback)
     mw.set_callback('attention', attention_callback)
 
-    # Start the device
     mw.start()
 
     try:
